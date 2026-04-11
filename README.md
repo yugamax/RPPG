@@ -1,27 +1,26 @@
-# rPPG Training and FastAPI Inference
+# rPPG Training using PhysNet (3D CNN)
 
-🚀 PhysNet-based 3D CNN for remote photoplethysmography (rPPG) with FastAPI deployment.
+🚀 Train a PhysNet-style 3D CNN for remote photoplethysmography (rPPG) using facial video.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-DeepLearning-orange)
-![FastAPI](https://img.shields.io/badge/FastAPI-API-green)
 ![License](https://img.shields.io/badge/License-MIT-purple)
 
 ---
 
 ## 📌 Overview
 
-This project trains a **PhysNet-style 3D CNN** for extracting rPPG signals from facial video and provides a **FastAPI-based inference server** for estimating vital signs.
+This project trains a **PhysNet-style 3D CNN** to extract rPPG signals from facial video and estimate physiological signals such as heart rate.
 
 ---
 
 ## ✨ Features
 
-- 🧠 Train an rPPG model on UBFC Dataset 1
-- 🎥 Extract per-frame rPPG signal from face ROI video
-- ❤️ Estimate Heart Rate (BPM) using frequency analysis
-- 🩸 Estimate SpO2 proxy using AC/DC ratio
-- ⚡ Deploy inference via FastAPI API endpoint
+- 🧠 Train an rPPG model on UBFC Dataset 1  
+- 🎥 Extract per-frame rPPG signal from face ROI video  
+- ❤️ Estimate Heart Rate (BPM) using frequency analysis  
+- 🩸 Estimate SpO2 proxy using AC/DC ratio  
+- 📈 Training logs and visualization outputs  
 
 ---
 
@@ -29,11 +28,10 @@ This project trains a **PhysNet-style 3D CNN** for extracting rPPG signals from 
 
 ```bash
 .
-├── trainrppg.py            # Training, evaluation, CLI inference
-├── fastapi_inference.py    # FastAPI server
-├── checkpoints/            # Saved models
-├── logs/                   # Training logs & plots
-└── data/                   # Dataset directory
+├── trainrppg.py        # Training, evaluation, CLI inference
+├── checkpoints/        # Saved models
+├── logs/               # Training logs & plots
+└── data/               # Dataset directory
 ```
 
 ---
@@ -72,7 +70,7 @@ Expected columns in `gtdump.xmp`:
 Install dependencies:
 
 ```bash
-pip install tensorflow keras opencv-python scipy scikit-learn matplotlib fastapi uvicorn python-multipart
+pip install tensorflow keras opencv-python scipy scikit-learn matplotlib
 ```
 
 Or:
@@ -91,68 +89,19 @@ pip install -r requirements.txt
 python trainrppg.py --mode train
 ```
 
-### 2. Start the API server
-
-```bash
-python fastapi_inference.py
-```
-
-Or using uvicorn:
-
-```bash
-uvicorn fastapi_inference:app --host 0.0.0.0 --port 8000
-```
-
-### 3. Verify server
-
-```bash
-curl http://localhost:8000/health
-```
-
----
-
-## 🧪 API Endpoints
-
-| Endpoint   | Method | Description                  |
-|------------|--------|------------------------------|
-| `/health`  | GET    | Check server status          |
-| `/infer`   | POST   | Upload video for inference   |
-
----
-
-## 📤 Inference Example (PowerShell)
-
-```powershell
-$videoPath = "C:\path\to\video.avi"
-Invoke-RestMethod -Uri "http://localhost:8000/infer" -Method Post -Form @{ file = Get-Item $videoPath }
-```
-
----
-
-## 📊 Example Response
-
-```json
-{
-  "bpm": 72.4,
-  "spo2": 97.1,
-  "duration_seconds": 12.8,
-  "num_frames": 384
-}
-```
-
 ---
 
 ## 🧠 Training Outputs
 
-- ✅ Best model → `checkpoints/best_physnet.keras`
-- 📄 Logs → `logs/training_log.csv`
-- 📈 Curves → `logs/training_curves.png`
+- ✅ Best model → `checkpoints/best_physnet.keras`  
+- 📄 Logs → `logs/training_log.csv`  
+- 📈 Curves → `logs/training_curves.png`  
 
 ---
 
-## 💻 CLI Inference
+## 💻 Script Inference (Optional)
 
-Run inference directly:
+Run one-off inference using the training script:
 
 ```bash
 python trainrppg.py --mode infer \
@@ -169,9 +118,9 @@ Outputs:
 
 ## ⚠️ Notes
 
-- Video must have enough frames (default: 128 frames)
-- SpO2 is an approximation (not medically accurate)
-- Parser may need adjustment if `gtdump.xmp` contains metadata
+- Video must have enough frames (default: 128 frames)  
+- SpO2 is an approximation (not medically accurate)  
+- Parser may need adjustment if `gtdump.xmp` contains metadata  
 
 ---
 
@@ -179,7 +128,6 @@ Outputs:
 
 **Model not found**
 - Ensure `checkpoints/best_physnet.keras` exists  
-- Update `MODEL_PATH` if needed  
 
 **No frames read**
 - Check video path and format  
