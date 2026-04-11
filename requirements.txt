@@ -1,0 +1,10 @@
+tensorflow
+keras
+numpy
+opencv-python
+scipy
+scikit-learn
+matplotlib
+fastapi
+uvicorn
+python-multipart
