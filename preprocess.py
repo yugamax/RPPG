@@ -17,7 +17,8 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # =====================
 # Each worker thread gets its own FaceMesh instance to avoid race conditions
 def make_face_mesh():
-    return mp.solutions.face_mesh.FaceMesh(
+    face_mesh_module = getattr(mp.solutions, "face_mesh")
+    return face_mesh_module.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
         refine_landmarks=True,
@@ -42,7 +43,7 @@ def fill_roi(mask, landmark_obj, indices, h, w):
 
 def get_roi_mean(frame_rgb, face_mesh_instance):
     """
-    Returns mean BGR values over forehead + cheek ROIs.
+    Returns mean RGB values over forehead + cheek ROIs.
     No manual channel boosting — let the model learn weighting.
     Returns None if no face detected.
     """
@@ -69,7 +70,18 @@ def get_roi_mean(frame_rgb, face_mesh_instance):
 # =====================
 def bandpass(sig, fs, lo=0.7, hi=4.0):
     nyq = fs / 2.0
-    b, a = butter(3, [lo / nyq, hi / nyq], btype='band')
+    if nyq <= 0:
+        raise ValueError("Invalid Nyquist frequency")
+
+    lo_adj = max(lo, 0.01)
+    hi_adj = min(hi, nyq * 0.95)
+    if lo_adj >= hi_adj:
+        raise ValueError(f"Invalid bandpass range for fs={fs}: lo={lo_adj}, hi={hi_adj}")
+
+    ba = butter(3, [lo_adj / nyq, hi_adj / nyq], btype='band', output='ba')
+    if not isinstance(ba, tuple) or len(ba) != 2:
+        raise ValueError("Unexpected filter coefficient format")
+    b, a = ba
     return filtfilt(b, a, sig)
 
 def normalize(sig):
@@ -83,6 +95,40 @@ def normalize_rgb(rgb_signal):
         out[:, c] = normalize(out[:, c])
     return out
 
+def parse_ground_truth(gt):
+    """Extract PPG and timestamp arrays from UBFC ground-truth text."""
+    arr = np.asarray(gt, dtype=np.float64)
+
+    if arr.ndim == 1:
+        raise ValueError("ground_truth.txt has 1D shape; expected at least 3 series")
+
+    if arr.shape[0] >= 3:
+        ppg = arr[0]
+        t = arr[2]
+    elif arr.shape[1] >= 3:
+        ppg = arr[:, 0]
+        t = arr[:, 2]
+    else:
+        raise ValueError(f"Unsupported ground-truth shape: {arr.shape}")
+
+    ppg = np.asarray(ppg, dtype=np.float64).ravel()
+    t = np.asarray(t, dtype=np.float64).ravel()
+
+    valid = np.isfinite(ppg) & np.isfinite(t)
+    ppg = ppg[valid]
+    t = t[valid]
+    if len(ppg) < 2 or len(t) < 2:
+        raise ValueError("Not enough valid GT samples")
+
+    order = np.argsort(t)
+    t = t[order]
+    ppg = ppg[order]
+
+    if np.allclose(t[0], t[-1]):
+        raise ValueError("GT timestamps are constant")
+
+    return ppg, t
+
 # =====================
 # PROCESS ONE SUBJECT
 # =====================
@@ -95,9 +141,11 @@ def process_subject(subj):
         return f"[SKIP] {subj} — missing files"
 
     # Load ground truth
-    gt  = np.loadtxt(gt_path)
-    ppg = gt[0]
-    t   = gt[2]
+    try:
+        gt = np.loadtxt(gt_path)
+        ppg, t = parse_ground_truth(gt)
+    except Exception as e:
+        return f"[SKIP] {subj} — bad ground truth ({e})"
 
     # Open video
     cap = cv2.VideoCapture(video_path)
@@ -114,24 +162,26 @@ def process_subject(subj):
     bad_frames  = 0
     idx         = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mean_rgb  = get_roi_mean(frame_rgb, face_mesh_instance)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mean_rgb  = get_roi_mean(frame_rgb, face_mesh_instance)
 
-        if mean_rgb is None:
-            bad_frames += 1
-            # Fill with previous value or zeros to maintain temporal alignment
-            mean_rgb = rgb_signal[-1] if rgb_signal else np.zeros(3)
+            if mean_rgb is None:
+                bad_frames += 1
+                # Fill with previous value or zeros to maintain temporal alignment
+                mean_rgb = rgb_signal[-1] if rgb_signal else np.zeros(3)
 
-        rgb_signal.append(mean_rgb)
-        timestamps.append(idx / fps)
-        idx += 1
-
-    cap.release()
+            rgb_signal.append(mean_rgb)
+            timestamps.append(idx / fps)
+            idx += 1
+    finally:
+        cap.release()
+        face_mesh_instance.close()
 
     if len(rgb_signal) < 64:
         return f"[SKIP] {subj} — too short ({len(rgb_signal)} frames)"
@@ -141,7 +191,10 @@ def process_subject(subj):
 
     # Align PPG to video timestamps
     aligned_ppg = np.interp(timestamps, t, ppg)
-    aligned_ppg = bandpass(aligned_ppg, fps)
+    try:
+        aligned_ppg = bandpass(aligned_ppg, fps)
+    except ValueError as e:
+        return f"[SKIP] {subj} — filtering failed ({e})"
     aligned_ppg = normalize(aligned_ppg).astype(np.float32)
 
     # Normalize RGB per channel BEFORE saving
@@ -158,11 +211,19 @@ def process_subject(subj):
 # MAIN
 # =====================
 def preprocess():
+    if not os.path.isdir(DATA_ROOT):
+        print(f"Dataset path not found: {DATA_ROOT}")
+        return
+
     subjects = sorted(
         d for d in os.listdir(DATA_ROOT)
         if os.path.isdir(os.path.join(DATA_ROOT, d))
     )
     print(f"Found {len(subjects)} subjects: {subjects}\n")
+
+    if not subjects:
+        print("No subject folders found. Nothing to preprocess.")
+        return
 
     # Parallel processing — MediaPipe CPU is the bottleneck here,
     # so threading across subjects speeds things up significantly.
@@ -172,7 +233,11 @@ def preprocess():
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(process_subject, s): s for s in subjects}
         for fut in as_completed(futures):
-            print(fut.result())
+            subj = futures[fut]
+            try:
+                print(fut.result())
+            except Exception as e:
+                print(f"[ERR] {subj} — unexpected failure ({e})")
 
     print("\n✅ Preprocessing complete")
 
