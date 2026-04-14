@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import numpy as np
 import torch
@@ -11,12 +12,16 @@ from torch.amp.grad_scaler import GradScaler
 # DEVICE
 # =====================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using: {device}")
-if device.type == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name(0)} ✅")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+
+def setup_device():
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using: {dev}")
+    if dev.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)} ✅")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    return dev
 
 # =====================
 # CONFIG
@@ -142,20 +147,67 @@ def load_checkpoint(model, optimizer, scheduler, scaler):
     print("🆕 Starting fresh training")
     return 0, float("inf"), 0
 
+
+def get_or_create_subject_split(processed_dir, split_file="subject_split.json", train_ratio=0.8):
+    subjects = sorted(
+        set(f.split("_")[0] for f in os.listdir(processed_dir) if f.endswith("_rgb.npy"))
+    )
+
+    if not subjects:
+        raise ValueError("No processed subjects found. Run preprocessing first.")
+
+    if os.path.exists(split_file):
+        with open(split_file, "r", encoding="utf-8") as f:
+            split_data = json.load(f)
+
+        train_subjects = split_data.get("train_subjects", [])
+        val_subjects = split_data.get("val_subjects", [])
+
+        saved_subjects = set(train_subjects) | set(val_subjects)
+        current_subjects = set(subjects)
+
+        # Keep exactly the persisted split; fail fast if dataset changed.
+        if saved_subjects != current_subjects:
+            missing = sorted(saved_subjects - current_subjects)
+            new = sorted(current_subjects - saved_subjects)
+            raise ValueError(
+                "Saved subject split does not match current processed subjects. "
+                f"Missing: {missing}. New: {new}. "
+                f"Delete {split_file} to regenerate a fresh split."
+            )
+
+        print(f"Loaded existing subject split from {split_file}")
+        return train_subjects, val_subjects
+
+    shuffled = subjects.copy()
+    random.shuffle(shuffled)
+    split_idx = int(train_ratio * len(shuffled))
+    train_subjects = shuffled[:split_idx]
+    val_subjects = shuffled[split_idx:]
+
+    split_data = {
+        "train_subjects": train_subjects,
+        "val_subjects": val_subjects,
+    }
+    with open(split_file, "w", encoding="utf-8") as f:
+        json.dump(split_data, f, indent=2)
+
+    print(f"Generated and saved subject split to {split_file}")
+    return train_subjects, val_subjects
+
 # =====================
 # TRAIN
 # =====================
 def train():
+    global device
+    device = setup_device()
+
     processed_dir = "processed"
-
-    subjects = sorted(
-        set(f.split("_")[0] for f in os.listdir(processed_dir) if f.endswith("_rgb.npy"))
+    train_subjects, val_subjects = get_or_create_subject_split(
+        processed_dir=processed_dir,
+        split_file="subject_split.json",
+        train_ratio=0.8,
     )
-    random.shuffle(subjects)
-
-    split          = int(0.8 * len(subjects))
-    train_subjects = subjects[:split]
-    val_subjects   = subjects[split:]
 
     print(f"Train subjects ({len(train_subjects)}): {train_subjects}")
     print(f"Val subjects  ({len(val_subjects)}):   {val_subjects}\n")
