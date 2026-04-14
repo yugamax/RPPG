@@ -27,6 +27,7 @@ RPPG/
 |   |-- subject1_fps.npy
 |   `-- ...
 |-- checkpoint.pth              (auto-created during training)
+|-- subject_split.json          (auto-created on first training run)
 `-- best_model.pth              (auto-created during training)
 ```
 
@@ -82,13 +83,19 @@ python trainrppg.py
 
 Training behavior:
 - Reads all `*_rgb.npy` files from `processed/`.
-- Splits subjects 80/20 into train/validation.
+- Creates a subject-wise 80/20 train/validation split once and saves it to `subject_split.json`.
+- Reuses the same saved split on future runs (including resume), so validation subjects stay fixed.
 - Trains TSCAN-like 1D model with Pearson loss.
 - Uses mixed precision (autocast + GradScaler).
 - Saves:
   - `checkpoint.pth` every epoch
   - `best_model.pth` on best validation loss
 - Supports resume from `checkpoint.pth` automatically.
+
+Split behavior details:
+- First run: generates and saves `subject_split.json`.
+- Next runs: loads `subject_split.json` and does not reshuffle subjects.
+- If processed subjects change, training stops with an error to avoid silent data leakage; delete `subject_split.json` to regenerate a fresh split.
 
 ## 5) Configuration Knobs
 
