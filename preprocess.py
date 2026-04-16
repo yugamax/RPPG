@@ -15,7 +15,6 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # =====================
 # MEDIAPIPE FACE MESH
 # =====================
-# Each worker thread gets its own FaceMesh instance to avoid race conditions
 def make_face_mesh():
     face_mesh_module = getattr(mp.solutions, "face_mesh")
     return face_mesh_module.FaceMesh(
@@ -26,10 +25,24 @@ def make_face_mesh():
         min_tracking_confidence=0.5,
     )
 
-# Landmark indices for three ROIs on the face
-FOREHEAD   = [10, 67, 103, 109, 338, 297, 332, 284]
-LEFT_CHEEK = [50, 101, 118, 119, 120, 121]
-RIGHT_CHEEK= [280, 330, 347, 348, 349, 350]
+# =====================
+# ROI LANDMARK INDICES
+# Weighted regions: forehead (high SNR), cheeks (good perfusion)
+# =====================
+FOREHEAD    = [10, 67, 103, 109, 338, 297, 332, 284]
+LEFT_CHEEK  = [50, 101, 118, 119, 120, 121]
+RIGHT_CHEEK = [280, 330, 347, 348, 349, 350]
+NOSE        = [4, 5, 195, 197, 6]           # 🔥 Stage 4: extra ROI (high perfusion)
+CHIN        = [152, 175, 199, 200, 208, 428]  # 🔥 Stage 4: extra ROI
+
+# 🔥 Stage 4: ROI weights (reflect signal quality at each region)
+ROI_WEIGHTS = {
+    "forehead":    1.5,   # highest SNR
+    "left_cheek":  1.2,
+    "right_cheek": 1.2,
+    "nose":        0.8,
+    "chin":        0.6,
+}
 
 def fill_roi(mask, landmark_obj, indices, h, w):
     """Fill a convex-hull ROI on the mask from a set of landmark indices."""
@@ -37,56 +50,132 @@ def fill_roi(mask, landmark_obj, indices, h, w):
     for i in indices:
         p = landmark_obj.landmark[i]
         pts.append([int(p.x * w), int(p.y * h)])
-    pts = np.array(pts, np.int32)
-    hull = cv2.convexHull(pts)           # fix: convexHull before fillConvexPoly
+    pts  = np.array(pts, np.int32)
+    hull = cv2.convexHull(pts)
     cv2.fillConvexPoly(mask, hull, 255)
+
 
 def get_roi_mean(frame_rgb, face_mesh_instance):
     """
-    Returns mean RGB values over forehead + cheek ROIs.
-    No manual channel boosting — let the model learn weighting.
-    Returns None if no face detected.
+    🔥 Stage 4: Weighted ROI averaging across 5 facial regions.
+    Returns weighted mean RGB, or None if no face detected.
     """
     h, w, _ = frame_rgb.shape
-    result = face_mesh_instance.process(frame_rgb)
+    result   = face_mesh_instance.process(frame_rgb)
     if not result.multi_face_landmarks:
         return None
 
-    lm   = result.multi_face_landmarks[0]
-    mask = np.zeros((h, w), dtype=np.uint8)
+    lm = result.multi_face_landmarks[0]
 
-    fill_roi(mask, lm, FOREHEAD,    h, w)
-    fill_roi(mask, lm, LEFT_CHEEK,  h, w)
-    fill_roi(mask, lm, RIGHT_CHEEK, h, w)
+    roi_defs = [
+        (FOREHEAD,    ROI_WEIGHTS["forehead"]),
+        (LEFT_CHEEK,  ROI_WEIGHTS["left_cheek"]),
+        (RIGHT_CHEEK, ROI_WEIGHTS["right_cheek"]),
+        (NOSE,        ROI_WEIGHTS["nose"]),
+        (CHIN,        ROI_WEIGHTS["chin"]),
+    ]
 
-    pixels = frame_rgb[mask == 255]      # shape (N, 3) — RGB
-    if len(pixels) == 0:
+    weighted_sum = np.zeros(3, dtype=np.float64)
+    total_weight = 0.0
+
+    for indices, weight in roi_defs:
+        mask = np.zeros((h, w), dtype=np.uint8)
+        fill_roi(mask, lm, indices, h, w)
+        pixels = frame_rgb[mask == 255]
+        if len(pixels) == 0:
+            continue
+        weighted_sum  += weight * pixels.mean(axis=0)
+        total_weight  += weight
+
+    if total_weight == 0:
         return None
 
-    return pixels.mean(axis=0)           # mean R, G, B — no artificial boost
+    return (weighted_sum / total_weight).astype(np.float32)
+
+
+# =====================
+# 🔥 Stage 4: POS METHOD
+# Plain Orthogonal to Skin — robust illumination-independent rPPG
+# Wang et al. (2017)
+# =====================
+def pos_method(rgb_signal):
+    """
+    POS rPPG signal extraction.
+    rgb_signal: (T, 3) float array, mean R/G/B per frame
+    Returns: (T,) float array
+    """
+    eps   = 1e-8
+    C     = rgb_signal.T.astype(np.float64)           # (3, T)
+
+    # Temporal normalization
+    mu    = C.mean(axis=1, keepdims=True)
+    C_n   = C / (mu + eps)
+
+    # POS projection matrix
+    S     = np.array([[0, 1, -1],
+                      [-2, 1,  1]], dtype=np.float64)
+    P     = S @ C_n                                   # (2, T)
+
+    # Combine rows with scaling
+    std1  = P[0].std() + eps
+    std2  = P[1].std() + eps
+    h     = P[0] + (std1 / std2) * P[1]
+
+    return h.astype(np.float32)
+
+
+# =====================
+# 🔥 Stage 4: CHROM METHOD
+# Chrominance-based rPPG — de Haan & Jeanne (2013)
+# =====================
+def chrom_method(rgb_signal):
+    """
+    CHROM rPPG signal extraction.
+    rgb_signal: (T, 3) float array
+    Returns: (T,) float array
+    """
+    eps = 1e-8
+    R   = rgb_signal[:, 0].astype(np.float64)
+    G   = rgb_signal[:, 1].astype(np.float64)
+    B   = rgb_signal[:, 2].astype(np.float64)
+
+    # Normalized chrominance signals
+    Xs  = 3 * R - 2 * G
+    Ys  = 1.5 * R + G - 1.5 * B
+
+    # Combine with ratio of stds to remove specular noise
+    std_x = Xs.std() + eps
+    std_y = Ys.std() + eps
+    h     = Xs - (std_x / std_y) * Ys
+
+    return h.astype(np.float32)
+
 
 # =====================
 # SIGNAL PROCESSING
 # =====================
 def bandpass(sig, fs, lo=0.7, hi=4.0):
-    nyq = fs / 2.0
-    if nyq <= 0:
-        raise ValueError("Invalid Nyquist frequency")
-
+    nyq    = fs / 2.0
     lo_adj = max(lo, 0.01)
     hi_adj = min(hi, nyq * 0.95)
     if lo_adj >= hi_adj:
         raise ValueError(f"Invalid bandpass range for fs={fs}: lo={lo_adj}, hi={hi_adj}")
-
-    ba = butter(3, [lo_adj / nyq, hi_adj / nyq], btype='band', output='ba')
-    if not isinstance(ba, tuple) or len(ba) != 2:
-        raise ValueError("Unexpected filter coefficient format")
-    b, a = ba
+    # butter() returns (b, a) or (z, p, k) depending on parameters. 
+    # To ensure it returns (b, a) in all versions, we explicitly expect 2.
+    ret = butter(3, [lo_adj / nyq, hi_adj / nyq], btype='band')
+    if isinstance(ret, tuple) and len(ret) == 2:
+        b, a = ret
+    else:
+        # Fallback for unexpected return types (e.g. if analog=True or output='sos' was used)
+        # or if type checkers are confused.
+        b, a = ret[0], ret[1]
     return filtfilt(b, a, sig)
+
 
 def normalize(sig):
     sig = detrend(sig)
     return (sig - sig.mean()) / (sig.std() + 1e-8)
+
 
 def normalize_rgb(rgb_signal):
     """Per-channel normalize so the model sees zero-mean unit-variance input."""
@@ -95,39 +184,34 @@ def normalize_rgb(rgb_signal):
         out[:, c] = normalize(out[:, c])
     return out
 
+
 def parse_ground_truth(gt):
-    """Extract PPG and timestamp arrays from UBFC ground-truth text."""
     arr = np.asarray(gt, dtype=np.float64)
-
     if arr.ndim == 1:
-        raise ValueError("ground_truth.txt has 1D shape; expected at least 3 series")
-
+        raise ValueError("ground_truth.txt is 1D; expected at least 3 series")
     if arr.shape[0] >= 3:
-        ppg = arr[0]
-        t = arr[2]
+        ppg, t = arr[0], arr[2]
     elif arr.shape[1] >= 3:
-        ppg = arr[:, 0]
-        t = arr[:, 2]
+        ppg, t = arr[:, 0], arr[:, 2]
     else:
         raise ValueError(f"Unsupported ground-truth shape: {arr.shape}")
 
-    ppg = np.asarray(ppg, dtype=np.float64).ravel()
-    t = np.asarray(t, dtype=np.float64).ravel()
-
+    ppg   = np.asarray(ppg, dtype=np.float64).ravel()
+    t     = np.asarray(t,   dtype=np.float64).ravel()
     valid = np.isfinite(ppg) & np.isfinite(t)
-    ppg = ppg[valid]
-    t = t[valid]
+    ppg, t = ppg[valid], t[valid]
+
     if len(ppg) < 2 or len(t) < 2:
         raise ValueError("Not enough valid GT samples")
 
-    order = np.argsort(t)
-    t = t[order]
-    ppg = ppg[order]
+    order  = np.argsort(t)
+    t, ppg = t[order], ppg[order]
 
     if np.allclose(t[0], t[-1]):
         raise ValueError("GT timestamps are constant")
 
     return ppg, t
+
 
 # =====================
 # PROCESS ONE SUBJECT
@@ -142,8 +226,8 @@ def process_subject(subj):
 
     # Load ground truth
     try:
-        gt = np.loadtxt(gt_path)
-        ppg, t = parse_ground_truth(gt)
+        gt        = np.loadtxt(gt_path)
+        ppg, t    = parse_ground_truth(gt)
     except Exception as e:
         return f"[SKIP] {subj} — bad ground truth ({e})"
 
@@ -154,13 +238,12 @@ def process_subject(subj):
         cap.release()
         return f"[SKIP] {subj} — bad FPS"
 
-    # Each thread has its own FaceMesh
     face_mesh_instance = make_face_mesh()
 
-    rgb_signal  = []
-    timestamps  = []
-    bad_frames  = 0
-    idx         = 0
+    rgb_signal = []
+    timestamps = []
+    bad_frames = 0
+    idx        = 0
 
     try:
         while True:
@@ -169,12 +252,11 @@ def process_subject(subj):
                 break
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mean_rgb  = get_roi_mean(frame_rgb, face_mesh_instance)
+            mean_rgb  = get_roi_mean(frame_rgb, face_mesh_instance)   # 🔥 weighted ROI
 
             if mean_rgb is None:
                 bad_frames += 1
-                # Fill with previous value or zeros to maintain temporal alignment
-                mean_rgb = rgb_signal[-1] if rgb_signal else np.zeros(3)
+                mean_rgb    = rgb_signal[-1] if rgb_signal else np.zeros(3, dtype=np.float32)
 
             rgb_signal.append(mean_rgb)
             timestamps.append(idx / fps)
@@ -189,7 +271,7 @@ def process_subject(subj):
     rgb_signal = np.array(rgb_signal, dtype=np.float32)   # (T, 3)
     timestamps = np.array(timestamps, dtype=np.float64)
 
-    # Align PPG to video timestamps
+    # Align PPG to video timestamps via interpolation
     aligned_ppg = np.interp(timestamps, t, ppg)
     try:
         aligned_ppg = bandpass(aligned_ppg, fps)
@@ -197,15 +279,34 @@ def process_subject(subj):
         return f"[SKIP] {subj} — filtering failed ({e})"
     aligned_ppg = normalize(aligned_ppg).astype(np.float32)
 
-    # Normalize RGB per channel BEFORE saving
+    # 🔥 Stage 4: Compute POS and CHROM signals
+    try:
+        pos_sig   = bandpass(pos_method(rgb_signal),   fps)
+        pos_sig   = normalize(pos_sig).astype(np.float32)
+    except Exception:
+        pos_sig   = np.zeros(len(rgb_signal), dtype=np.float32)
+
+    try:
+        chrom_sig = bandpass(chrom_method(rgb_signal), fps)
+        chrom_sig = normalize(chrom_sig).astype(np.float32)
+    except Exception:
+        chrom_sig = np.zeros(len(rgb_signal), dtype=np.float32)
+
+    # Per-channel normalize RGB BEFORE saving
     rgb_signal = normalize_rgb(rgb_signal)
 
-    # Save
-    np.save(os.path.join(SAVE_DIR, f"{subj}_rgb.npy"), rgb_signal)
-    np.save(os.path.join(SAVE_DIR, f"{subj}_ppg.npy"), aligned_ppg)
-    np.save(os.path.join(SAVE_DIR, f"{subj}_fps.npy"), np.array([fps], dtype=np.float32))
+    # Save all signals
+    np.save(os.path.join(SAVE_DIR, f"{subj}_rgb.npy"),   rgb_signal)
+    np.save(os.path.join(SAVE_DIR, f"{subj}_ppg.npy"),   aligned_ppg)
+    np.save(os.path.join(SAVE_DIR, f"{subj}_fps.npy"),   np.array([fps], dtype=np.float32))
+    np.save(os.path.join(SAVE_DIR, f"{subj}_pos.npy"),   pos_sig)    # 🔥 POS signal
+    np.save(os.path.join(SAVE_DIR, f"{subj}_chrom.npy"), chrom_sig)  # 🔥 CHROM signal
 
-    return f"[OK] {subj} — {idx} frames, {bad_frames} bad ({100*bad_frames/max(idx,1):.1f}%)"
+    return (
+        f"[OK] {subj} — {idx} frames, {bad_frames} bad "
+        f"({100 * bad_frames / max(idx, 1):.1f}%)"
+    )
+
 
 # =====================
 # MAIN
@@ -225,9 +326,6 @@ def preprocess():
         print("No subject folders found. Nothing to preprocess.")
         return
 
-    # Parallel processing — MediaPipe CPU is the bottleneck here,
-    # so threading across subjects speeds things up significantly.
-    # Keep workers ≤ CPU cores; 4 is safe for most systems.
     max_workers = min(4, len(subjects))
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -240,6 +338,7 @@ def preprocess():
                 print(f"[ERR] {subj} — unexpected failure ({e})")
 
     print("\n✅ Preprocessing complete")
+
 
 if __name__ == "__main__":
     preprocess()
