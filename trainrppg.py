@@ -80,16 +80,16 @@ class SubjectDataset(Dataset):
             # 🔥 Stage 1: Strong augmentation
 
             # 1. Gaussian noise (channel-aware: more on R/B, less on G)
-            noise_scale        = np.random.uniform(0.02, 0.08)
+            noise_scale        = np.random.uniform(0.01, 0.04)
             channel_noise      = np.array([1.2, 0.8, 1.2])[:, None]  # protect green
             x += (noise_scale * channel_noise * np.random.randn(*x.shape)).astype(np.float32)
 
             # 2. Random per-channel scaling (simulate skin tone / lighting)
-            scale = np.random.uniform(0.80, 1.20, size=(3, 1)).astype(np.float32)
+            scale = np.random.uniform(0.90, 1.10, size=(3, 1)).astype(np.float32)
             x *= scale
 
             # 3. Random DC offset (lighting drift)
-            x += np.random.uniform(-0.15, 0.15, size=(3, 1)).astype(np.float32)
+            x += np.random.uniform(-0.08, 0.08, size=(3, 1)).astype(np.float32)
 
             # 4. Temporal flip (PPG is periodic, flip is valid)
             if np.random.rand() < 0.3:
@@ -239,6 +239,9 @@ class TSCAN(nn.Module):
         # 🔥 Stage 3: Temporal self-attention
         feat = self.temporal_attn(feat)
 
+        # 🔥 NEW: dropout after attention (reduces overfitting)
+        feat = F.dropout(feat, p=0.2, training=self.training)
+
         # Channel attention
         attn = self.channel_attn(feat).unsqueeze(-1)
         feat = feat * attn
@@ -271,8 +274,8 @@ def frequency_loss(pred, target, fps=30.0, low_hz=0.7, high_hz=4.0):
     # Bandpass mask
     mask    = (freq >= low_hz) & (freq <= high_hz)
 
-    pred_f  = torch.fft.rfft(pred,   norm="ortho")   # (B, T//2+1)
-    tgt_f   = torch.fft.rfft(target, norm="ortho")
+    pred_f  = torch.fft.rfft(pred.float(),   norm="ortho")   # (B, T//2+1)
+    tgt_f   = torch.fft.rfft(target.float(), norm="ortho")
 
     pred_p  = pred_f.abs()[..., mask]                # (B, F_band)
     tgt_p   = tgt_f.abs()[..., mask]
@@ -284,7 +287,7 @@ def frequency_loss(pred, target, fps=30.0, low_hz=0.7, high_hz=4.0):
     return F.mse_loss(pred_p, tgt_p)
 
 
-def combined_loss(pred, target, fps_batch, freq_weight=0.5):
+def combined_loss(pred, target, fps_batch, freq_weight=0.3):
     """
     Stage 1: Pearson loss + frequency-domain loss.
     freq_weight controls balance (0 = pure Pearson, 1 = pure frequency).
@@ -459,7 +462,7 @@ def train():
         val_loss      /= n_val
         gap            = val_loss - train_loss
 
-        scheduler.step()
+        scheduler.step(epoch)
         lr = optimizer.param_groups[0]["lr"]
 
         if val_loss < best_val:
