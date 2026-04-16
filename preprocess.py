@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =====================
 # PATHS
 # =====================
-DATA_ROOT = "UBFC_DATASET/DATASET_2"
+DATA_ROOT = "data/UBFC_DATASET/DATASET_2"
 SAVE_DIR  = "processed"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
