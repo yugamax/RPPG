@@ -12,7 +12,6 @@ from torch.amp.grad_scaler import GradScaler
 # DEVICE
 # =====================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using:", device)
 
 # =====================
 # CONFIG
@@ -265,4 +264,5 @@ def train():
 
 
 if __name__ == "__main__":
+    print("Using:", device)
     train()
