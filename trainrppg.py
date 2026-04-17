@@ -12,16 +12,17 @@ from torch.amp.grad_scaler import GradScaler
 # DEVICE
 # =====================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using:", device)
 
 # =====================
 # CONFIG
 # =====================
 SEQ_LEN    = 256
-BATCH_SIZE = 16      # smaller → noisier gradients → implicit regularization
-LR         = 1e-4    # lower LR to slow convergence and stay in the flat region longer
+BATCH_SIZE = 16
+LR         = 2e-4    # raised back up — model was learning too slowly
 EPOCHS     = 200
-PATIENCE   = 20      # tighter patience since val plateaus fast
-GRAD_CLIP  = 0.5     # was 1.0 — tighter clip reduces big gradient spikes
+PATIENCE   = 25
+GRAD_CLIP  = 0.5
 
 # =====================
 # DATASET
@@ -30,7 +31,6 @@ class SubjectDataset(Dataset):
     def __init__(self, processed_dir, subjects, seq_len=SEQ_LEN, stride=None, augment=False):
         self.samples = []
         self.augment = augment
-        # FIXED: no overlap between train windows; val uses full stride too
         stride = stride or seq_len
 
         for subj in subjects:
@@ -49,43 +49,42 @@ class SubjectDataset(Dataset):
     def __getitem__(self, idx):
         x, y, fps = self.samples[idx]
 
-        # Normalize per channel
         x = (x - x.mean(axis=1, keepdims=True)) / (x.std(axis=1, keepdims=True) + 1e-8)
         y = (y - y.mean()) / (y.std() + 1e-8)
 
         if self.augment:
-            # Gaussian noise
+            # Gaussian noise — mild
             x += np.random.normal(0, 0.03, x.shape).astype(np.float32)
 
             # Per-channel scale jitter
-            scale = np.random.uniform(0.85, 1.15, size=(3, 1)).astype(np.float32)
+            scale = np.random.uniform(0.9, 1.1, size=(3, 1)).astype(np.float32)
             x *= scale
 
-            # Random temporal flip (HR signal is symmetric)
+            # Temporal flip
             if random.random() < 0.5:
                 x = x[:, ::-1].copy()
                 y = y[::-1].copy()
 
-            # Mixup-style baseline drift (low-freq additive noise)
-            t = np.linspace(0, 2 * np.pi, x.shape[1]).astype(np.float32)
+            # Low-freq baseline drift
+            t    = np.linspace(0, 2 * np.pi, x.shape[1]).astype(np.float32)
             freq = np.random.uniform(0.01, 0.1)
-            drift = (np.random.uniform(-0.1, 0.1) * np.sin(freq * t)).astype(np.float32)
+            drift = (np.random.uniform(-0.08, 0.08) * np.sin(freq * t)).astype(np.float32)
             x += drift[np.newaxis, :]
 
         return torch.from_numpy(x), torch.from_numpy(y), torch.tensor(fps, dtype=torch.float32)
 
 
 # =====================
-# MODEL  (slimmer + regularized)
+# MODEL — balanced capacity
 # =====================
 class DilatedBlock(nn.Module):
-    def __init__(self, ch_in, ch_out, dilation, dropout=0.1):
+    def __init__(self, ch_in, ch_out, dilation, dropout=0.0):
         super().__init__()
-        self.conv  = nn.Conv1d(ch_in, ch_out, 3, padding=dilation, dilation=dilation)
-        self.bn    = nn.BatchNorm1d(ch_out)
-        self.act   = nn.GELU()
-        self.drop  = nn.Dropout(dropout)
-        self.skip  = nn.Conv1d(ch_in, ch_out, 1) if ch_in != ch_out else nn.Identity()
+        self.conv = nn.Conv1d(ch_in, ch_out, 3, padding=dilation, dilation=dilation)
+        self.bn   = nn.BatchNorm1d(ch_out)
+        self.act  = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.skip = nn.Conv1d(ch_in, ch_out, 1) if ch_in != ch_out else nn.Identity()
 
     def forward(self, x):
         return self.drop(self.act(self.bn(self.conv(x)))) + self.skip(x)
@@ -93,37 +92,36 @@ class DilatedBlock(nn.Module):
 
 class TSCAN(nn.Module):
     """
-    Slimmer encoder (fewer channels) + attention dropout + output dropout.
-    Fewer parameters = less capacity to memorize training set.
+    Restored to medium capacity (56/72 channels) — between the original (64/96)
+    and the over-regularized version (48/64). Dropout only on the deeper layers
+    where overfitting risk is highest, not on shallow feature extractors.
     """
-    def __init__(self, dropout=0.15):
+    def __init__(self):
         super().__init__()
 
-        # Reduced channel widths: 64→48, 96→64
         self.encoder = nn.Sequential(
-            DilatedBlock(3,  48, 1,  dropout),
-            DilatedBlock(48, 48, 2,  dropout),
-            DilatedBlock(48, 64, 4,  dropout),
-            DilatedBlock(64, 64, 8,  dropout),
-            DilatedBlock(64, 48, 16, dropout),
+            DilatedBlock(3,  56, 1,  dropout=0.0),   # early layers: no dropout
+            DilatedBlock(56, 56, 2,  dropout=0.0),
+            DilatedBlock(56, 72, 4,  dropout=0.1),   # deeper: light dropout
+            DilatedBlock(72, 72, 8,  dropout=0.1),
+            DilatedBlock(72, 56, 16, dropout=0.1),
         )
 
-        # Attention with dropout
-        self.attn = nn.MultiheadAttention(48, 4, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(48)
+        # Attention: mild dropout only
+        self.attn = nn.MultiheadAttention(56, 4, dropout=0.05, batch_first=True)
+        self.norm = nn.LayerNorm(56)
 
-        self.out_drop = nn.Dropout(dropout)
-        self.head = nn.Conv1d(48, 1, 1)
+        self.head = nn.Conv1d(56, 1, 1)
 
     def forward(self, x):
-        feat = self.encoder(x)                       # (B, 48, T)
+        feat = self.encoder(x)
 
-        f = feat.permute(0, 2, 1)                   # (B, T, 48)
+        f = feat.permute(0, 2, 1)
         attn_out, _ = self.attn(f, f, f)
-        f = self.norm(f + attn_out)                 # pre-norm residual
-        f = f.permute(0, 2, 1)                      # (B, 48, T)
+        f = self.norm(f + attn_out)
+        f = f.permute(0, 2, 1)
 
-        return self.head(self.out_drop(f)).squeeze(1)
+        return self.head(f).squeeze(1)
 
 
 # =====================
@@ -157,7 +155,6 @@ def frequency_loss(pred, target, fps):
 def combined_loss(pred, target, fps):
     l1 = pearson_loss(pred, target)
     l2 = frequency_loss(pred, target, fps.mean().item())
-    # Reduced freq weight: was 1.5 — FFT loss variance was destabilizing val
     return 0.7 * l1 + 0.8 * l2
 
 
@@ -174,7 +171,6 @@ def train():
     train_subj = subjects[:split]
     val_subj   = subjects[split:]
 
-    # No overlap in training stride (was SEQ_LEN//2 which inflated dataset artificially)
     train_ds = SubjectDataset(processed_dir, train_subj, stride=SEQ_LEN, augment=True)
     val_ds   = SubjectDataset(processed_dir, val_subj,   stride=SEQ_LEN, augment=False)
 
@@ -185,7 +181,7 @@ def train():
 
     model = TSCAN().to(device)
 
-    # Weight decay for L2 regularization — separated from bias/norm params
+    # Weight decay only on weight matrices, not biases or norm layers
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if "bn" in name or "norm" in name or "bias" in name:
@@ -194,14 +190,14 @@ def train():
             decay.append(p)
 
     opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 1e-3},
+        [{"params": decay,    "weight_decay": 3e-4},   # reduced from 1e-3
          {"params": no_decay, "weight_decay": 0.0}],
         lr=LR
     )
 
-    # Warmup + cosine: ramps up for 10 epochs then cosines down
+    # Shorter warmup (5 epochs) then cosine — dataset is small, warmup of 10 was too slow
     def lr_lambda(epoch):
-        warmup = 10
+        warmup = 5
         if epoch < warmup:
             return (epoch + 1) / warmup
         progress = (epoch - warmup) / max(1, EPOCHS - warmup)
@@ -248,8 +244,9 @@ def train():
         val_loss   /= len(val_loader)
         sched.step()
 
+        gap = val_loss - train_loss
         current_lr = opt.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1:3d}: Train={train_loss:.4f}  Val={val_loss:.4f}  LR={current_lr:.2e}")
+        print(f"Epoch {epoch+1:3d}: Train={train_loss:.4f}  Val={val_loss:.4f}  Gap={gap:+.4f}  LR={current_lr:.2e}")
 
         if val_loss < best_val:
             best_val = val_loss
@@ -264,5 +261,4 @@ def train():
 
 
 if __name__ == "__main__":
-    print("Using:", device)
     train()
