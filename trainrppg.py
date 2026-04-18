@@ -12,7 +12,6 @@ from torch.amp.grad_scaler import GradScaler
 # DEVICE
 # =====================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using:", device)
 
 # =====================
 # CONFIG
@@ -72,6 +71,14 @@ class SubjectDataset(Dataset):
             drift = (np.random.uniform(-0.08, 0.08) * np.sin(freq * t)).astype(np.float32)
             x += drift[np.newaxis, :]
 
+            # Per-channel mean shift to simulate camera/skin tone variation
+            shift = np.random.uniform(-0.15, 0.15, size=(3, 1)).astype(np.float32)
+            x += shift
+
+            # Per-channel gamma perturbation to simulate exposure changes
+            gamma = np.random.uniform(0.85, 1.15, size=(3, 1)).astype(np.float32)
+            x = np.sign(x) * (np.abs(x) ** gamma)
+
             # Random temporal crop then resize back to fixed length
             if random.random() < 0.4:
                 seq_len = self.seq_len
@@ -122,10 +129,10 @@ class TSCAN(nn.Module):
 
         self.encoder = nn.Sequential(
             DilatedBlock(3,  56, 1,  dropout=0.0),   # early layers: no dropout
-            DilatedBlock(56, 56, 2,  dropout=0.0),
-            DilatedBlock(56, 72, 4,  dropout=0.1),   # deeper: light dropout
-            DilatedBlock(72, 72, 8,  dropout=0.1),
-            DilatedBlock(72, 56, 16, dropout=0.1),
+            DilatedBlock(56, 56, 2,  dropout=0.05),
+            DilatedBlock(56, 72, 4,  dropout=0.15),
+            DilatedBlock(72, 72, 8,  dropout=0.15),
+            DilatedBlock(72, 56, 16, dropout=0.2),
         )
 
         # Attention: stronger dropout to regularize the most expressive block
@@ -185,13 +192,13 @@ def combined_loss(pred, target, fps):
 # =====================
 def train():
     processed_dir = "processed"
+    print(f"Using: {device}")
 
     subjects = sorted(set(f.split("_")[0] for f in os.listdir(processed_dir)))
-    random.shuffle(subjects)
-
-    split      = int(0.8 * len(subjects))
-    train_subj = subjects[:split]
-    val_subj   = subjects[split:]
+    subjects_sorted = sorted(subjects)
+    val_subj = subjects_sorted[::5]
+    val_set = set(val_subj)
+    train_subj = [s for s in subjects_sorted if s not in val_set]
 
     train_ds = SubjectDataset(processed_dir, train_subj, stride=SEQ_LEN, augment=True)
     val_ds   = SubjectDataset(processed_dir, val_subj,   stride=SEQ_LEN // 2, augment=False)
@@ -222,11 +229,10 @@ def train():
         warmup = 5
         if epoch < warmup:
             return (epoch + 1) / warmup
-        progress = (epoch - warmup) / max(1, EPOCHS - warmup)
-        return 0.5 * (1 + np.cos(np.pi * progress))
+        progress = (epoch - warmup) / max(1, 80 - warmup)
+        return max(0.05, 0.5 * (1 + np.cos(np.pi * progress)))
 
     sched  = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    sched2 = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=8, factor=0.5)
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
     best_val = float("inf")
@@ -269,7 +275,6 @@ def train():
         val_history.append(val_loss)
         smoothed_val = float(np.mean(val_history[-3:]))
         sched.step()
-        sched2.step(val_loss)
 
         gap = val_loss - train_loss
         current_lr = opt.param_groups[0]["lr"]
