@@ -246,7 +246,13 @@ def train():
         return max(0.05, 0.5 * (1 + np.cos(np.pi * progress)))
 
     sched  = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    use_amp = device.type == "cuda" and torch.cuda.is_available()
+    scaler = GradScaler(enabled=use_amp)
+
+    if use_amp:
+        print("AMP enabled")
+    else:
+        print("AMP disabled; running in full precision")
 
     best_val = float("inf")
     patience  = 0
@@ -264,15 +270,22 @@ def train():
             x, y, fps = x.to(device), y.to(device), fps.to(device)
             opt.zero_grad()
 
-            with autocast(device_type=device.type):
+            with autocast(device_type=device.type, enabled=use_amp):
                 pred = model(x)
                 loss = combined_loss(pred, y, fps)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+            else:
+                loss.backward()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            scaler.step(opt)
-            scaler.update()
+            if use_amp:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             train_loss += loss.item()
 
         # --- Val ---
@@ -282,7 +295,7 @@ def train():
         with torch.no_grad():
             for x, y, fps in val_loader:
                 x, y, fps = x.to(device), y.to(device), fps.to(device)
-                with autocast(device_type=device.type):
+                with autocast(device_type=device.type, enabled=use_amp):
                     pred = model(x)
                     val_loss += combined_loss(pred, y, fps.detach()).item()
 
