@@ -31,6 +31,7 @@ class SubjectDataset(Dataset):
     def __init__(self, processed_dir, subjects, seq_len=SEQ_LEN, stride=None, augment=False):
         self.samples = []
         self.augment = augment
+        self.seq_len = seq_len
         stride = stride or seq_len
 
         for subj in subjects:
@@ -71,6 +72,26 @@ class SubjectDataset(Dataset):
             drift = (np.random.uniform(-0.08, 0.08) * np.sin(freq * t)).astype(np.float32)
             x += drift[np.newaxis, :]
 
+            # Random temporal crop then resize back to fixed length
+            if random.random() < 0.4:
+                seq_len = self.seq_len
+                crop_len = int(seq_len * random.uniform(0.85, 1.0))
+                start = random.randint(0, seq_len - crop_len)
+                x_crop = x[:, start:start + crop_len]
+                y_crop = y[start:start + crop_len]
+
+                x = F.interpolate(
+                    torch.from_numpy(x_crop[None]),
+                    size=seq_len,
+                    mode="linear",
+                    align_corners=False,
+                )[0].numpy()
+                y = np.interp(
+                    np.linspace(0, 1, seq_len),
+                    np.linspace(0, 1, crop_len),
+                    y_crop,
+                ).astype(np.float32)
+
         return torch.from_numpy(x), torch.from_numpy(y), torch.tensor(fps, dtype=torch.float32)
 
 
@@ -107,9 +128,10 @@ class TSCAN(nn.Module):
             DilatedBlock(72, 56, 16, dropout=0.1),
         )
 
-        # Attention: mild dropout only
-        self.attn = nn.MultiheadAttention(56, 4, dropout=0.05, batch_first=True)
+        # Attention: stronger dropout to regularize the most expressive block
+        self.attn = nn.MultiheadAttention(56, 4, dropout=0.15, batch_first=True)
         self.norm = nn.LayerNorm(56)
+        self.norm_drop = nn.Dropout(0.1)
 
         self.head = nn.Conv1d(56, 1, 1)
 
@@ -118,7 +140,7 @@ class TSCAN(nn.Module):
 
         f = feat.permute(0, 2, 1)
         attn_out, _ = self.attn(f, f, f)
-        f = self.norm(f + attn_out)
+        f = self.norm_drop(self.norm(f + attn_out))
         f = f.permute(0, 2, 1)
 
         return self.head(f).squeeze(1)
@@ -155,7 +177,7 @@ def frequency_loss(pred, target, fps):
 def combined_loss(pred, target, fps):
     l1 = pearson_loss(pred, target)
     l2 = frequency_loss(pred, target, fps.mean().item())
-    return 0.7 * l1 + 0.8 * l2
+    return 0.6 * l1 + 0.4 * l2
 
 
 # =====================
@@ -172,7 +194,7 @@ def train():
     val_subj   = subjects[split:]
 
     train_ds = SubjectDataset(processed_dir, train_subj, stride=SEQ_LEN, augment=True)
-    val_ds   = SubjectDataset(processed_dir, val_subj,   stride=SEQ_LEN, augment=False)
+    val_ds   = SubjectDataset(processed_dir, val_subj,   stride=SEQ_LEN // 2, augment=False)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, pin_memory=True)
@@ -204,10 +226,12 @@ def train():
         return 0.5 * (1 + np.cos(np.pi * progress))
 
     sched  = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    sched2 = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=8, factor=0.5)
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
     best_val = float("inf")
     patience  = 0
+    val_history = []
 
     for epoch in range(EPOCHS):
         # --- Train ---
@@ -242,14 +266,20 @@ def train():
 
         train_loss /= len(train_loader)
         val_loss   /= len(val_loader)
+        val_history.append(val_loss)
+        smoothed_val = float(np.mean(val_history[-3:]))
         sched.step()
+        sched2.step(val_loss)
 
         gap = val_loss - train_loss
         current_lr = opt.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1:3d}: Train={train_loss:.4f}  Val={val_loss:.4f}  Gap={gap:+.4f}  LR={current_lr:.2e}")
+        print(
+            f"Epoch {epoch+1:3d}: Train={train_loss:.4f}  Val={val_loss:.4f}  "
+            f"SmoothedVal={smoothed_val:.4f}  Gap={gap:+.4f}  LR={current_lr:.2e}"
+        )
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if smoothed_val < best_val:
+            best_val = smoothed_val
             torch.save(model.state_dict(), "best_model.pth")
             patience = 0
         else:
