@@ -17,7 +17,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # CONFIG
 # =====================
 SEQ_LEN    = 256
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 LR         = 2e-4    # raised back up — model was learning too slowly
 EPOCHS     = 200
 PATIENCE   = 25
@@ -164,10 +164,21 @@ def pearson_loss(pred, target):
     return 1 - (num / den).mean()
 
 
+# Cache frequency masks by sequence length, fps, and device.
+_freq_mask_cache = {}
+
+
 def frequency_loss(pred, target, fps):
     B, T = pred.shape
-    freq = torch.fft.rfftfreq(T, d=1.0 / fps).to(pred.device)
-    mask = (freq >= 0.7) & (freq <= 4.0)
+    fps_val = float(fps)
+    device_key = (pred.device.type, pred.device.index if pred.device.index is not None else -1)
+    key = (T, round(fps_val, 2), device_key)
+
+    if key not in _freq_mask_cache:
+        freq = torch.fft.rfftfreq(T, d=1.0 / fps_val)
+        _freq_mask_cache[key] = ((freq >= 0.7) & (freq <= 4.0)).to(pred.device)
+
+    mask = _freq_mask_cache[key]
 
     pred_f = torch.fft.rfft(pred.float())
     tgt_f  = torch.fft.rfft(target.float())
@@ -182,6 +193,8 @@ def frequency_loss(pred, target, fps):
 
 
 def combined_loss(pred, target, fps):
+    pred = pred.float()
+    target = target.float()
     l1 = pearson_loss(pred, target)
     l2 = frequency_loss(pred, target, fps.mean().item())
     return 0.6 * l1 + 0.4 * l2
@@ -240,6 +253,9 @@ def train():
     val_history = []
 
     for epoch in range(EPOCHS):
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         # --- Train ---
         model.train()
         train_loss = 0.0
@@ -268,7 +284,7 @@ def train():
                 x, y, fps = x.to(device), y.to(device), fps.to(device)
                 with autocast(device_type=device.type):
                     pred = model(x)
-                    val_loss += combined_loss(pred, y, fps).item()
+                    val_loss += combined_loss(pred, y, fps.detach()).item()
 
         train_loss /= len(train_loader)
         val_loss   /= len(val_loader)
