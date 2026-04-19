@@ -153,3 +153,25 @@ python trainrppg.py
 ```
 
 That is the full pipeline.
+
+## 9) FastAPI Inference
+
+After training, start the API with:
+
+```powershell
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+The API exposes:
+- `GET /health` to verify the model is loaded.
+- `POST /predict` for raw RGB sequences in JSON.
+- `POST /predict/video` for an uploaded video file.
+
+Example JSON body for `POST /predict`:
+
+```json
+{
+  "fps": 30,
+  "rgb": [[0.12, 0.15, 0.11], [0.13, 0.16, 0.12], [0.14, 0.17, 0.13]]
+}
+```
